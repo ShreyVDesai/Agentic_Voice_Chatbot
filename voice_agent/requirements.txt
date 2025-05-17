@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+twilio
+google-cloud-storage
+openai-agents
+google-cloud-speech

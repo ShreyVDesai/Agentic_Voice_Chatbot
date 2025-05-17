@@ -11,9 +11,10 @@ from fastapi.responses import JSONResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream, Say
 from dotenv import load_dotenv
 from agents import Agent, Runner
-from agents.voice import VoicePipeline, VoiceWorkflowBase, VoiceInput, VoiceResult
+from agents.voice import VoicePipeline, VoiceWorkflowBase
 from google.cloud import storage
 from google.api_core.exceptions import GoogleAPIError
+from google.cloud import speech
 
 # --- Environment Setup ---
 load_dotenv()
@@ -57,8 +58,18 @@ agent = Agent(
     instructions="You are a helpful AI assistant that talks clearly and informatively."
 )
 
+class VoiceResult:
+    def __init__(self, text, audio=None):
+        self.text = text
+        self.audio = audio
+        self.metadata = type("Metadata", (), {
+            "input_text": text,
+            "output_text": text
+        })()
+
+
 class MyVoiceWorkflow(VoiceWorkflowBase):
-    async def run(self, inputs: VoiceInput) -> VoiceResult:
+    async def run(self, user_text: str) -> VoiceResult:
         user_text = inputs.text
         logger.info(f"[Agent Input] {user_text}")
         ai_resp = Runner.run_sync(agent, user_text).final_output
@@ -74,6 +85,27 @@ try:
 except GoogleAPIError as e:
     logger.error("Failed to connect to Google Cloud Storage: %s", str(e))
     raise
+# Speech setup
+speech_client = speech.SpeechClient()
+
+# --- Helpers ---
+def transcribe_audio(audio_bytes: bytes) -> str:
+    audio = speech.RecognitionAudio(content=audio_bytes)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
+        sample_rate_hertz=8000,  # Twilio typically streams in 8kHz mu-law
+        language_code="en-US"
+    )
+    try:
+        response = speech_client.recognize(config=config, audio=audio)
+        if response.results:
+            return response.results[0].alternatives[0].transcript
+        else:
+            return ""
+    except Exception as e:
+        logger.warning(f"STT failed: {e}")
+        return ""
+
 
 # --- Routes ---
 
@@ -113,7 +145,15 @@ async def media_stream(ws: WebSocket):
                 all_audio.extend(audio_chunk)
 
                 try:
-                    result: VoiceResult = await voice_pipeline.run(audio_chunk)
+                    transcribed_text = transcribe_audio(audio_chunk)
+                    if transcribed_text:
+                        result: VoiceResult = await voice_pipeline.run(transcribed_text)
+                        transcript.append({
+                            "input_text": result.metadata.input_text,
+                            "output_text": result.metadata.output_text
+                        })
+
+
                 except Exception as e:
                     logger.warning("Error in pipeline run: %s", str(e))
                     continue
