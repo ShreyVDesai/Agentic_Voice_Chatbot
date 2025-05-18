@@ -7,5 +7,4 @@ openai-agents
 google-cloud-speech
 google-cloud-texttospeech
 webrtcvad
-gTTS 
-pydub
+boto3

@@ -21,9 +21,8 @@ from dotenv import load_dotenv
 
 from workflows.combined import route_and_run  # your agent pipeline
 
-from gtts import gTTS
-from pydub import AudioSegment
-import io
+import boto3
+import audioop
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +35,9 @@ TWILIO_SID        = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN      = os.getenv("TWILIO_AUTH_TOKEN")
 GCP_PROJECT       = os.getenv("GCP_PROJECT")
 TRANSCRIPTS_BUCKET= os.getenv("TRANSCRIPTS_BUCKET")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
+AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")  # default region
 
 missing = [k for k,v in {
     "OPENAI_API_KEY": OPENAI_API_KEY,
@@ -72,22 +74,31 @@ FRAME_DURATION_MS = 20
 FRAME_BYTES = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+polly_client = boto3.client(
+    "polly",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION,
+)
 def synthesize_audio(text: str) -> bytes:
-    inp = texttospeech.SynthesisInput(text=text)
-    voice = texttospeech.VoiceSelectionParams(
-        language_code="en-US", ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-    )
-    cfg = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MULAW,
-        sample_rate_hertz=8000
-    )
-    resp = tts_client.synthesize_speech(input=inp, voice=voice, audio_config=cfg)
+    """
+    Use Amazon Polly to synthesize `text` into 8kHz μ-law audio bytes.
+    """
+    try:
+        response = polly_client.synthesize_speech(
+            Text=text,
+            OutputFormat="pcm",    # raw PCM
+            VoiceId="Joanna",      # or another Polly voice
+            SampleRate="8000"
+        )
+        pcm_audio = response["AudioStream"].read()
+        # Convert 16-bit PCM to 8-bit μ-law
+        mulaw_audio = audioop.lin2ulaw(pcm_audio, 2)
+        return mulaw_audio
 
-    # Remove WAV header (first 58 bytes)
-    # mulaw_audio = resp.audio_content[44:]
-
-    # return mulaw_audio
-    return resp
+    except Exception as e:
+        logger.error(f"Polly synthesis failed: {e}")
+        return b""
 
 
 def transcribe_audio(audio_bytes: bytes) -> str:
