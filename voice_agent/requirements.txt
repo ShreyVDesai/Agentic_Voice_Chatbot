@@ -5,3 +5,4 @@ twilio
 google-cloud-storage
 openai-agents
 google-cloud-speech
+google-cloud-texttospeech
