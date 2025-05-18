@@ -1,427 +1,236 @@
-# # main.py
-
-# import os
-# import json
-# import base64
-# import uuid
-# import logging
-# from fastapi import FastAPI, WebSocket, Request, Response, WebSocketDisconnect
-# from fastapi.middleware.cors import CORSMiddleware
-# from fastapi.responses import JSONResponse
-# from twilio.twiml.voice_response import VoiceResponse, Connect, Stream, Say
-# from dotenv import load_dotenv
-# from agents import Agent, Runner
-# from agents.voice import VoicePipeline, VoiceWorkflowBase
-# from google.cloud import storage, texttospeech
-# from google.api_core.exceptions import GoogleAPIError
-# from google.cloud import speech
-# # from voice_pipeline import transcribe_audio  # Your Whisper or ASR module
-# from workflows.combined import route_and_run        # Agentic combined workflow
-
-# # --- Environment Setup ---
-# load_dotenv()
-# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
-# TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-# GCP_PROJECT = os.getenv("GCP_PROJECT")
-# TRANSCRIPTS_BUCKET = os.getenv("TRANSCRIPTS_BUCKET")
-
-# # --- Validation ---
-# required_vars = {
-#     "OPENAI_API_KEY": OPENAI_API_KEY,
-#     "TWILIO_ACCOUNT_SID": TWILIO_SID,
-#     "TWILIO_AUTH_TOKEN": TWILIO_TOKEN,
-#     "GCP_PROJECT": GCP_PROJECT,
-#     "TRANSCRIPTS_BUCKET": TRANSCRIPTS_BUCKET
-# }
-# missing = [key for key, value in required_vars.items() if not value]
-# if missing:
-#     raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
-
-# # --- Logging Setup ---
-# logging.basicConfig(level=logging.INFO)
-# logger = logging.getLogger("voice-agent")
-
-# # --- FastAPI Initialization ---
-# app = FastAPI(title="Voice AI Agent", version="1.0")
-
-# # --- CORS for testing / local dev ---
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],  # tighten in prod
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# # --- Agent & Workflow ---
-# agent = Agent(
-#     name="VoiceAssistant",
-#     instructions="You are a helpful AI assistant that talks clearly and informatively."
-# )
-
-# class VoiceResult:
-#     def __init__(self, text, audio=None):
-#         self.text = text
-#         self.audio = audio
-#         self.metadata = type("Metadata", (), {
-#             "input_text": text,
-#             "output_text": text
-#         })()
-
-
-# class MyVoiceWorkflow(VoiceWorkflowBase):
-#     async def run(self, user_text: str) -> VoiceResult:
-#         user_text = inputs.text
-#         logger.info(f"[Agent Input] {user_text}")
-#         ai_resp = Runner.run_sync(agent, user_text).final_output
-#         logger.info(f"[Agent Response] {ai_resp}")
-#         return VoiceResult(text=ai_resp)
-
-# voice_pipeline = VoicePipeline(workflow=MyVoiceWorkflow())
-
-# # --- GCS Setup ---
-# try:
-#     storage_client = storage.Client(project=GCP_PROJECT)
-#     bucket = storage_client.bucket(TRANSCRIPTS_BUCKET)
-# except GoogleAPIError as e:
-#     logger.error("Failed to connect to Google Cloud Storage: %s", str(e))
-#     raise
-# # Speech setup
-# speech_client = speech.SpeechClient()
-
-# # --- Helpers ---
-# def transcribe_audio(audio_bytes: bytes) -> str:
-#     audio = speech.RecognitionAudio(content=audio_bytes)
-#     config = speech.RecognitionConfig(
-#         encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
-#         sample_rate_hertz=8000,  # Twilio typically streams in 8kHz mu-law
-#         language_code="en-US"
-#     )
-#     try:
-#         response = speech_client.recognize(config=config, audio=audio)
-#         if response.results:
-#             return response.results[0].alternatives[0].transcript
-#         else:
-#             return ""
-#     except Exception as e:
-#         logger.warning(f"STT failed: {e}")
-#         return ""
-
-# tts_client = texttospeech.TextToSpeechClient()
-
-# def synthesize_audio(text: str) -> bytes:
-#     input_text = texttospeech.SynthesisInput(text=text)
-#     voice = texttospeech.VoiceSelectionParams(
-#         language_code="en-US",
-#         ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-#     )
-#     audio_config = texttospeech.AudioConfig(
-#         audio_encoding=texttospeech.AudioEncoding.MULAW,  # Required by Twilio
-#         sample_rate_hertz=8000  # Required by Twilio
-#     )
-
-#     try:
-#         response = tts_client.synthesize_speech(
-#             input=input_text,
-#             voice=voice,
-#             audio_config=audio_config
-#         )
-#         return response.audio_content
-#     except Exception as e:
-#         # Optional: fallback or logging
-#         import logging
-#         logging.getLogger("voice-agent").error(f"TTS synthesis failed: {str(e)}")
-#         return b''
-
-# # --- Routes ---
-
-# @app.get("/health", tags=["Health"])
-# async def health_check():
-#     return JSONResponse(status_code=200, content={"status": "ok"})
-
-# @app.post("/incoming-call", tags=["Twilio"])
-# async def incoming_call(request: Request):
-#     """Handles Twilio webhook and returns TwiML to start streaming"""
-#     try:
-#         response = VoiceResponse()
-#         response.say("Connecting you to the AI voice assistant.")
-#         connect = Connect()
-#         connect.append(Stream(url=f"wss://{request.url.hostname}/media-stream"))
-#         response.append(connect)
-#         return Response(content=str(response), media_type="application/xml")
-#     except Exception as e:
-#         logger.exception("Error generating TwiML")
-#         return JSONResponse(status_code=500, content={"error": "Failed to generate TwiML"})
-
-# @app.websocket("/media-stream")
-# async def media_stream(ws: WebSocket):
-#     await ws.accept()
-#     session_id = str(uuid.uuid4())
-#     transcript = []
-#     all_audio = bytearray()
-
-#     try:
-#         while True:
-#             message = await ws.receive_text()
-#             event = json.loads(message)
-
-#             if event["event"] == "media":
-#                 audio_chunk = base64.b64decode(event["media"]["payload"])
-#                 all_audio.extend(audio_chunk)
-
-#                 # 1) Transcribe
-#                 text = transcribe_audio(audio_chunk)
-#                 if not text:
-#                     continue
-#                 logging.info(f"ASR: {text}")
-
-#                 # 2) Route & run agentic workflow
-#                 try:
-#                     agent_result = await route_and_run(text)
-#                     response_text = agent_result.final_output
-#                 except Exception as e:
-#                     logging.warning(f"Agent error: {e}")
-#                     response_text = "Sorry, I couldn't process that."
-
-#                 transcript.append({"input": text, "output": response_text})
-
-#                 # 3) Synthesize
-#                 audio_out = synthesize_audio(response_text)
-#                 if audio_out:
-#                     payload = base64.b64encode(audio_out).decode()
-#                     await ws.send_json({
-#                         "event": "media",
-#                         "streamSid": event["streamSid"],
-#                         "media": {"payload": payload}
-#                     })
-
-#             elif event["event"] == "stop":
-#                 logging.info("Call ended, cleaning up.")
-#                 break
-
-#     except WebSocketDisconnect:
-#         logging.warning("WebSocket disconnected unexpectedly.")
-#     except Exception as e:
-#         logging.exception("Unexpected error in media stream.")
-
-#     finally:
-#         await ws.close()
-#         # Persist audio + transcript to GCS
-#         try:
-#             bucket.blob(f"sessions/{session_id}.wav") \
-#                   .upload_from_string(bytes(all_audio), content_type="audio/wav")
-#             bucket.blob(f"sessions/{session_id}.json") \
-#                   .upload_from_string(json.dumps(transcript, indent=2),
-#                                       content_type="application/json")
-#             logging.info(f"Session {session_id} stored in GCS.")
-#         except GoogleAPIError as e:
-#             logging.error(f"GCS upload failed: {e}")
-
 # main.py
 
 import os
 import json
 import base64
 import uuid
+import time
 import logging
-from fastapi import FastAPI, WebSocket, Request, Response, WebSocketDisconnect
+import webrtcvad
+from collections import deque
+
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
-from dotenv import load_dotenv
-from agents.voice import VoicePipeline, VoiceWorkflowBase
-from google.cloud import storage, texttospeech
+
+from twilio.twiml.voice_response import VoiceResponse, Start, Stream
+from twilio.rest import Client
+from google.cloud import storage, texttospeech, speech
 from google.api_core.exceptions import GoogleAPIError
-from google.cloud import speech
-from workflows.combined import route_and_run  # ✅ Your unified agentic workflow
+from dotenv import load_dotenv
 
-# --- Environment Setup ---
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-GCP_PROJECT = os.getenv("GCP_PROJECT")
-TRANSCRIPTS_BUCKET = os.getenv("TRANSCRIPTS_BUCKET")
+from workflows.combined import route_and_run  # your agent pipeline
 
-# --- Validation ---
-required_vars = {
-    "OPENAI_API_KEY": OPENAI_API_KEY,
-    "TWILIO_ACCOUNT_SID": TWILIO_SID,
-    "TWILIO_AUTH_TOKEN": TWILIO_TOKEN,
-    "GCP_PROJECT": GCP_PROJECT,
-    "TRANSCRIPTS_BUCKET": TRANSCRIPTS_BUCKET
-}
-missing = [key for key, value in required_vars.items() if not value]
-if missing:
-    raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
+from gtts import gTTS
+from pydub import AudioSegment
+import io
 
-# --- Logging Setup ---
+# ─── Logging Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-agent")
 
-# --- FastAPI Initialization ---
-app = FastAPI(title="Voice AI Agent", version="1.0")
+# ─── Environment ───────────────────────────────────────────────────────────────
+load_dotenv()
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+TWILIO_SID        = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN      = os.getenv("TWILIO_AUTH_TOKEN")
+GCP_PROJECT       = os.getenv("GCP_PROJECT")
+TRANSCRIPTS_BUCKET= os.getenv("TRANSCRIPTS_BUCKET")
 
-# --- CORS for testing / local dev ---
+missing = [k for k,v in {
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "TWILIO_SID": TWILIO_SID,
+    "TWILIO_TOKEN": TWILIO_TOKEN,
+    "GCP_PROJECT": GCP_PROJECT,
+    "TRANSCRIPTS_BUCKET": TRANSCRIPTS_BUCKET,
+}.items() if not v]
+if missing:
+    logger.error(f"Missing vars: {missing}")
+    raise EnvironmentError(f"Missing vars: {missing}")
+
+# ─── FastAPI & CORS ────────────────────────────────────────────────────────────
+app = FastAPI(title="Voice AI Agent")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- GCS Setup ---
-try:
-    storage_client = storage.Client(project=GCP_PROJECT)
-    bucket = storage_client.bucket(TRANSCRIPTS_BUCKET)
-except GoogleAPIError as e:
-    logger.error("Failed to connect to Google Cloud Storage: %s", str(e))
-    raise
-
+# ─── Google Cloud Clients ─────────────────────────────────────────────────────
+storage_client = storage.Client(project=GCP_PROJECT)
+bucket = storage_client.bucket(TRANSCRIPTS_BUCKET)
 speech_client = speech.SpeechClient()
+tts_client    = texttospeech.TextToSpeechClient()
 
-# --- TTS ---
-tts_client = texttospeech.TextToSpeechClient()
+# ─── Twilio REST Client ───────────────────────────────────────────────────────
+twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
+# ─── VAD Setup ────────────────────────────────────────────────────────────────
+vad = webrtcvad.Vad(2)
+SAMPLE_RATE = 8000
+FRAME_DURATION_MS = 20
+FRAME_BYTES = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000)
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 def synthesize_audio(text: str) -> bytes:
-    input_text = texttospeech.SynthesisInput(text=text)
+    inp = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(
-        language_code="en-US",
-        ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
+        language_code="en-US", ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
     )
-    audio_config = texttospeech.AudioConfig(
+    cfg = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.MULAW,
         sample_rate_hertz=8000
     )
-    try:
-        response = tts_client.synthesize_speech(
-            input=input_text,
-            voice=voice,
-            audio_config=audio_config
-        )
-        return response.audio_content
-    except Exception as e:
-        logger.error(f"TTS synthesis failed: {str(e)}")
-        return b''
+    resp = tts_client.synthesize_speech(input=inp, voice=voice, audio_config=cfg)
+
+    # Remove WAV header (first 58 bytes)
+    # mulaw_audio = resp.audio_content[44:]
+
+    # return mulaw_audio
+    return resp
+
 
 def transcribe_audio(audio_bytes: bytes) -> str:
     audio = speech.RecognitionAudio(content=audio_bytes)
-    config = speech.RecognitionConfig(
+    cfg = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
-        sample_rate_hertz=8000,
+        sample_rate_hertz=SAMPLE_RATE,
         language_code="en-US"
     )
-    try:
-        response = speech_client.recognize(config=config, audio=audio)
-        if response.results:
-            return response.results[0].alternatives[0].transcript
-        else:
-            return ""
-    except Exception as e:
-        logger.warning(f"STT failed: {e}")
-        return ""
+    resp = speech_client.recognize(config=cfg, audio=audio)
+    if resp.results:
+        return resp.results[0].alternatives[0].transcript
+    return ""
 
-# --- Voice Workflow ---
+def is_speech(frame: bytes) -> bool:
+    if len(frame) != FRAME_BYTES:
+        return False
+    return vad.is_speech(frame, SAMPLE_RATE)
 
-class VoiceResult:
-    def __init__(self, text, audio=None):
-        self.text = text
-        self.audio = audio
-        self.metadata = type("Metadata", (), {
-            "input_text": text,
-            "output_text": text
-        })()
+# ─── Routes ────────────────────────────────────────────────────────────────────
 
-class MyVoiceWorkflow(VoiceWorkflowBase):
-    async def run(self, user_text: str) -> VoiceResult:
-        logger.info(f"[Agent Input] {user_text}")
-        try:
-            agent_result = await route_and_run(user_text)
-            ai_resp = agent_result.final_output
-        except Exception as e:
-            logger.warning(f"[Agent Error] {e}")
-            ai_resp = "Sorry, I couldn't process that."
-        logger.info(f"[Agent Response] {ai_resp}")
-        return VoiceResult(text=ai_resp)
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
 
-voice_pipeline = VoicePipeline(workflow=MyVoiceWorkflow())
-
-# --- Routes ---
-
-@app.get("/health", tags=["Health"])
-async def health_check():
-    return JSONResponse(status_code=200, content={"status": "ok"})
-
-@app.post("/incoming-call", tags=["Twilio"])
+@app.post("/incoming-call")
 async def incoming_call(request: Request):
-    try:
-        response = VoiceResponse()
-        response.say("Connecting you to the AI voice assistant.")
-        connect = Connect()
-        connect.append(Stream(url=f"wss://{request.url.hostname}/media-stream"))
-        response.append(connect)
-        return Response(content=str(response), media_type="application/xml")
-    except Exception as e:
-        logger.exception("Error generating TwiML")
-        return JSONResponse(status_code=500, content={"error": "Failed to generate TwiML"})
+    """Welcome and redirect to start streaming."""
+    logger.info("Incoming call received")
+    resp = VoiceResponse()
+    resp.say("Welcome to the AI assistant. Please wait…", voice="Polly.Joanna")
+    resp.redirect("/start-stream")
+    return Response(content=str(resp), media_type="application/xml")
+
+@app.post("/start-stream")
+async def start_stream(request: Request):
+    """Begin media stream and hold call open."""
+    logger.info("Starting media stream")
+    resp = VoiceResponse()
+    start = Start()
+    start.stream(url=f"wss://{request.url.hostname}/media-stream")
+    resp.append(start)
+    resp.pause(length=60)  # initial hold
+    return Response(content=str(resp), media_type="application/xml")
 
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
+    """
+    Bidirectional voice loop:
+      - Receive inbound chunks until silence → transcribe → agent → reply
+      - Use Twilio REST API to play reply and re-start stream
+    """
     await ws.accept()
     session_id = str(uuid.uuid4())
+    logger.info(f"WS session {session_id} started")
+
+    full_audio = bytearray()
+    speech_buffer = bytearray()
+    last_speech = time.time()
     transcript = []
-    all_audio = bytearray()
+
+    SILENCE_FRAMES = int((1.5 * 1000) / FRAME_DURATION_MS)
+
+    # We need the call SID from the Twilio start event
+    call_sid = None
 
     try:
         while True:
-            message = await ws.receive_text()
-            event = json.loads(message)
+            msg = await ws.receive_text()
+            ev = json.loads(msg)
 
-            if event["event"] == "media":
-                audio_chunk = base64.b64decode(event["media"]["payload"])
-                all_audio.extend(audio_chunk)
+            # Capture call SID on 'start' event
+            if ev["event"] == "start" and not call_sid:
+                call_sid = ev["start"]["callSid"]
+                logger.info(f"Call SID: {call_sid}")
 
-                text = transcribe_audio(audio_chunk)
-                if not text:
-                    continue
-                logging.info(f"ASR: {text}")
+            if ev["event"] == "media":
+                chunk = base64.b64decode(ev["media"]["payload"])
+                full_audio.extend(chunk)
 
-                try:
-                    agent_result = await route_and_run(text)
-                    response_text = agent_result.final_output
-                except Exception as e:
-                    logging.warning(f"Agent error: {e}")
-                    response_text = "Sorry, I couldn't process that."
+                # Frame‑level VAD
+                for i in range(0, len(chunk), FRAME_BYTES):
+                    frame = chunk[i:i+FRAME_BYTES]
+                    if len(frame) < FRAME_BYTES: break
 
-                transcript.append({"input": text, "output": response_text})
+                    if is_speech(frame):
+                        last_speech = time.time()
+                        speech_buffer.extend(frame)
+                    # else, silence frame
 
-                audio_out = synthesize_audio(response_text)
-                if audio_out:
-                    payload = base64.b64encode(audio_out).decode()
-                    await ws.send_json({
-                        "event": "media",
-                        "streamSid": event["streamSid"],
-                        "media": {"payload": payload}
-                    })
+                # If user paused long enough, process
+                if speech_buffer and (time.time() - last_speech) > 1.5:
+                    audio_bytes = bytes(speech_buffer)
+                    speech_buffer.clear()
 
-            elif event["event"] == "stop":
-                logging.info("Call ended, cleaning up.")
+                    # Transcribe
+                    user_text = transcribe_audio(audio_bytes)
+                    if not user_text.strip():
+                        last_speech = time.time()
+                        continue
+
+                    logger.info(f"Transcribed: {user_text}")
+
+                    # Agentic response
+                    try:
+                        agent_res = await route_and_run(user_text)
+                        reply = agent_res.final_output
+                    except Exception as e:
+                        logger.error(e)
+                        reply = "Sorry, I couldn't process that."
+
+                    logger.info(f"Replying: {reply}")
+                    transcript.append({"input": user_text, "output": reply})
+                    out_bytes = synthesize_audio(reply)
+                    
+                    await ws.send_json({"event": "media","media": {"payload": base64.b64encode(out_bytes).decode()}})
+                    # Send reply via Twilio REST and re‑start stream
+                    # twilio_client.calls(call_sid).update(
+                    #     twiml=(
+                    #         "<Response>"
+                    #           f"<Say>{reply}</Say>"
+                    #           "<Start><Stream "
+                    #             f"url='wss://{ws.scope['server'][0]}/media-stream'/>"
+                    #           "</Start>"
+                    #         "</Response>"
+                    #     )
+                    # )
+                    last_speech = time.time()
+
+            elif ev["event"] == "stop":
+                logger.info("Stop event: ending")
                 break
 
     except WebSocketDisconnect:
-        logging.warning("WebSocket disconnected unexpectedly.")
-    except Exception as e:
-        logging.exception("Unexpected error in media stream.")
+        logger.warning("WebSocket disconnected")
     finally:
-        await ws.close()
-        try:
-            bucket.blob(f"sessions/{session_id}.wav") \
-                  .upload_from_string(bytes(all_audio), content_type="audio/wav")
-            bucket.blob(f"sessions/{session_id}.json") \
-                  .upload_from_string(json.dumps(transcript, indent=2),
-                                      content_type="application/json")
-            logging.info(f"Session {session_id} stored in GCS.")
-        except GoogleAPIError as e:
-            logging.error(f"GCS upload failed: {e}")
+        # Clean up
+        try: await ws.close()
+        except: pass
+        # Upload
+        bucket.blob(f"sessions/{session_id}.wav") \
+              .upload_from_string(bytes(full_audio), content_type="audio/wav")
+        bucket.blob(f"sessions/{session_id}.json") \
+              .upload_from_string(json.dumps(transcript), content_type="application/json")
+        logger.info(f"Session {session_id} complete")
+
